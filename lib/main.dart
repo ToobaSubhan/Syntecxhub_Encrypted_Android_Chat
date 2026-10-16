@@ -3,23 +3,57 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:cryptography/cryptography.dart';
 
 // ---------------------- 1. CONFIGURATION ----------------------
 class ServerConfig {
+  // Set this to the server machine's IPv4 address (run `ipconfig` on Windows).
   // The phone and server must be on the same network.
-  static const String host = '192.168.1.103';
+  static const String host = '192.168.1.104';
   static const int port = 5000;
 }
 
-// ---------------------- 2. CRYPTO UTILS (AES-256-GCM) ----------------------
+// ---------------------- 2. SECURE STORAGE ----------------------
+/// Thin wrapper over Android Keystore-backed storage.
+class SecureStore {
+  static const FlutterSecureStorage _storage = FlutterSecureStorage();
+
+  static Future<String?> read(String key) => _storage.read(key: key);
+  static Future<void> write(String key, String value) =>
+      _storage.write(key: key, value: value);
+  static Future<void> deleteAll() => _storage.deleteAll();
+}
+
+// ---------------------- 3. CRYPTO UTILS (AES-256-GCM) ----------------------
 class CryptoUtils {
-  // Pre-shared 256-bit key (must match the server).
-  static final List<int> _keyBytes = _hexToBytes(
-    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
-  );
-  static final SecretKey _secretKey = SecretKey(_keyBytes);
+  static const String _keyName = 'aes_key_hex';
   static final AesGcm _algorithm = AesGcm.with256bits();
+  static SecretKey? _secretKey;
+
+  static bool get hasKey => _secretKey != null;
+
+  static bool isValidKey(String hex) =>
+      RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(hex);
+
+  /// Loads the pre-shared key from secure storage (if one was saved).
+  static Future<void> init() async {
+    final hex = await SecureStore.read(_keyName);
+    if (hex != null && isValidKey(hex)) {
+      _secretKey = SecretKey(_hexToBytes(hex));
+    }
+  }
+
+  static Future<void> saveKey(String hex) async {
+    await SecureStore.write(_keyName, hex);
+    _secretKey = SecretKey(_hexToBytes(hex));
+  }
+
+  /// Removes the key and all stored chat history.
+  static Future<void> resetAll() async {
+    await SecureStore.deleteAll();
+    _secretKey = null;
+  }
 
   static List<int> _hexToBytes(String hex) {
     final result = <int>[];
@@ -32,29 +66,72 @@ class CryptoUtils {
   /// Returns nonce (12) || ciphertext || tag (16). A fresh random nonce is
   /// generated per message by the library.
   static Future<List<int>> encrypt(List<int> plaintext) async {
-    final SecretBox secretBox = await _algorithm.encrypt(
-      plaintext,
-      secretKey: _secretKey,
-    );
-    return [...secretBox.nonce, ...secretBox.cipherText, ...secretBox.mac.bytes];
+    final key = _secretKey;
+    if (key == null) throw StateError('No key set');
+    final SecretBox box = await _algorithm.encrypt(plaintext, secretKey: key);
+    return [...box.nonce, ...box.cipherText, ...box.mac.bytes];
   }
 
   static Future<List<int>> decrypt(List<int> data) async {
+    final key = _secretKey;
+    if (key == null) throw StateError('No key set');
     if (data.length < 12 + 16) throw Exception('Invalid ciphertext length');
     final nonce = data.sublist(0, 12);
     final tag = data.sublist(data.length - 16);
     final cipherText = data.sublist(12, data.length - 16);
-    final secretBox = SecretBox(cipherText, nonce: nonce, mac: Mac(tag));
-    return _algorithm.decrypt(secretBox, secretKey: _secretKey);
+    final box = SecretBox(cipherText, nonce: nonce, mac: Mac(tag));
+    return _algorithm.decrypt(box, secretKey: key);
   }
 }
 
-// ---------------------- 3. TCP CHAT CLIENT ----------------------
+// ---------------------- 4. MESSAGE MODEL + HISTORY ----------------------
+class Message {
+  final String text;
+  final bool isMe;
+  const Message(this.text, this.isMe);
+
+  Map<String, dynamic> toJson() => {'t': text, 'm': isMe};
+  factory Message.fromJson(Map<String, dynamic> json) =>
+      Message(json['t'] as String, json['m'] as bool);
+}
+
+/// Per-contact chat history, kept in Keystore-backed secure storage.
+class HistoryStore {
+  static const int _maxMessages = 200;
+  static String _key(String contact) => 'history_$contact';
+
+  static Future<List<Message>> load(String contact) async {
+    try {
+      final raw = await SecureStore.read(_key(contact));
+      if (raw == null) return [];
+      return (jsonDecode(raw) as List)
+          .map((e) => Message.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static Future<void> save(String contact, List<Message> messages) async {
+    final recent = messages.length > _maxMessages
+        ? messages.sublist(messages.length - _maxMessages)
+        : messages;
+    try {
+      await SecureStore.write(
+        _key(contact),
+        jsonEncode(recent.map((m) => m.toJson()).toList()),
+      );
+    } catch (_) {}
+  }
+}
+
+// ---------------------- 5. TCP CHAT CLIENT ----------------------
 class ChatClient {
   Socket? _socket;
   final void Function() onConnected;
   final void Function(String) onMessageReceived;
   final void Function(String) onDisconnected;
+  final void Function(String)? onError;
 
   final List<int> _buffer = [];
 
@@ -62,6 +139,7 @@ class ChatClient {
     required this.onConnected,
     required this.onMessageReceived,
     required this.onDisconnected,
+    this.onError,
   });
 
   Future<void> connect() async {
@@ -113,7 +191,8 @@ class ChatClient {
       final decrypted = await CryptoUtils.decrypt(data);
       onMessageReceived(utf8.decode(decrypted));
     } catch (_) {
-      // Drop messages that fail authentication/decryption.
+      // Authentication failed: wrong key or tampered message. Drop it.
+      onError?.call('Decryption failed: check key');
     }
   }
 
@@ -143,11 +222,27 @@ class ChatClient {
   }
 }
 
-// ---------------------- 4. UI COMPONENTS ----------------------
-void main() => runApp(const MyApp());
+// ---------------------- 6. UI COMPONENTS ----------------------
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await CryptoUtils.init();
+  runApp(const MyApp());
+}
 
-class MyApp extends StatelessWidget {
+class MyApp extends StatefulWidget {
   const MyApp({super.key});
+
+  @override
+  State<MyApp> createState() => _MyAppState();
+}
+
+class _MyAppState extends State<MyApp> {
+  bool _hasKey = CryptoUtils.hasKey;
+
+  Future<void> _reset() async {
+    await CryptoUtils.resetAll();
+    if (mounted) setState(() => _hasKey = false);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -155,13 +250,92 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'Encrypted Chat',
       theme: ThemeData(primarySwatch: Colors.teal, useMaterial3: true),
-      home: const HomeScreen(),
+      home: _hasKey
+          ? HomeScreen(onReset: _reset)
+          : KeySetupScreen(onSaved: () => setState(() => _hasKey = true)),
+    );
+  }
+}
+
+/// Shown on first launch (or after a reset): the shared key is entered once
+/// and stored in the Android Keystore, never in source code.
+class KeySetupScreen extends StatefulWidget {
+  final VoidCallback onSaved;
+  const KeySetupScreen({super.key, required this.onSaved});
+
+  @override
+  State<KeySetupScreen> createState() => _KeySetupScreenState();
+}
+
+class _KeySetupScreenState extends State<KeySetupScreen> {
+  final TextEditingController _controller = TextEditingController();
+  String? _error;
+  bool _obscure = true;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final hex = _controller.text.trim().toLowerCase();
+    if (!CryptoUtils.isValidKey(hex)) {
+      setState(() => _error = 'Key must be 64 hex characters (256-bit).');
+      return;
+    }
+    await CryptoUtils.saveKey(hex);
+    widget.onSaved();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.teal,
+        foregroundColor: Colors.white,
+        title: const Text('Set Encryption Key'),
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'Enter the 256-bit shared key (64 hex characters) used by the '
+                    'server. It is stored in the Android Keystore.',
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _controller,
+                obscureText: _obscure,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  labelText: 'Shared key (hex)',
+                  border: const OutlineInputBorder(),
+                  errorText: _error,
+                  suffixIcon: IconButton(
+                    icon: Icon(_obscure ? Icons.visibility : Icons.visibility_off),
+                    onPressed: () => setState(() => _obscure = !_obscure),
+                  ),
+                ),
+                onSubmitted: (_) => _save(),
+              ),
+              const SizedBox(height: 16),
+              FilledButton(onPressed: _save, child: const Text('Save key')),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
 
 class HomeScreen extends StatelessWidget {
-  const HomeScreen({super.key});
+  final VoidCallback onReset;
+  const HomeScreen({super.key, required this.onReset});
 
   @override
   Widget build(BuildContext context) {
@@ -172,6 +346,14 @@ class HomeScreen extends StatelessWidget {
           backgroundColor: Colors.teal,
           foregroundColor: Colors.white,
           title: const Text('MyChat'),
+          actions: [
+            PopupMenuButton<String>(
+              onSelected: (_) => onReset(),
+              itemBuilder: (_) => const [
+                PopupMenuItem(value: 'reset', child: Text('Reset key & history')),
+              ],
+            ),
+          ],
           bottom: const TabBar(
             labelColor: Colors.white,
             unselectedLabelColor: Colors.white70,
@@ -228,12 +410,6 @@ class ChatsScreen extends StatelessWidget {
   }
 }
 
-class Message {
-  final String text;
-  final bool isMe;
-  const Message(this.text, this.isMe);
-}
-
 class ChatScreen extends StatefulWidget {
   final String title;
   const ChatScreen({super.key, required this.title});
@@ -247,6 +423,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<Message> _messages = [];
   late final ChatClient _client;
   String _status = 'Connecting...';
+  bool _historyLoaded = false;
 
   @override
   void initState() {
@@ -254,11 +431,31 @@ class _ChatScreenState extends State<ChatScreen> {
     _client = ChatClient(
       onConnected: () => _setStatus('Secure Channel Active'),
       onMessageReceived: (text) {
-        if (mounted) setState(() => _messages.add(Message(text, false)));
+        if (!mounted) return;
+        setState(() => _messages.add(Message(text, false)));
+        _persist();
       },
       onDisconnected: _setStatus,
+      onError: _setStatus,
     );
+    _loadHistory();
     _connect();
+  }
+
+  Future<void> _loadHistory() async {
+    final saved = await HistoryStore.load(widget.title);
+    if (!mounted) return;
+    setState(() {
+      _messages.insertAll(0, saved);
+      _historyLoaded = true;
+    });
+    _persist();
+  }
+
+  // Saves only after the stored history has been loaded, so it is never
+  // overwritten by messages that arrived first.
+  void _persist() {
+    if (_historyLoaded) HistoryStore.save(widget.title, _messages);
   }
 
   void _setStatus(String status) {
@@ -285,6 +482,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _messages.add(Message(text, true));
       _controller.clear();
     });
+    _persist();
   }
 
   @override

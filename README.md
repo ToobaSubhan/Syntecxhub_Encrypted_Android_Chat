@@ -1,100 +1,106 @@
-# Encrypted Chat App
+# Syntecxhub_Encrypted_Android_Chat
 
-A real-time encrypted chat system built for the **Syntecxhub Cybersecurity Virtual Internship** (Week 2). It has two parts that talk to each other over the same network protocol:
+Encrypted chat prototype built for the **Syntecxhub Cyber Security Internship (Project 2: Encrypted Android Chat)**.
+A Flutter Android client encrypts every message on the device with **AES-256-GCM** before sending it over a raw **TCP** socket to a multi-client Python server.
 
-- **`server/`** — a multi-client TCP relay server written in Python
-- **`android-app/`** — an Android chat client written in Flutter (Dart)
+## Features
 
-A terminal test client (`server/client.py`) is also included so the system can be tested without a second physical device.
+- **Client-side AES-256-GCM encryption and decryption**: Real-time encryption/decryption on the device.
+- **Fresh random 12-byte nonce per message**: Prevents IV reuse attacks.
+- **Authenticated encryption**: Tampered or corrupted messages fail the GCM tag check and are dropped.
+- **Length-prefixed TCP framing**: Reassembles split or merged packets using a 4-byte big-endian header.
+- **Multi-client Python server**: Handles concurrent connections with optional debug logging.
+- **Secure Key Storage**: Key stored in the **Android Keystore** (via `flutter_secure_storage`), entered once on first launch and never kept in source code.
+- **Message History**: Per-contact history persisted in secure storage (last 200 messages).
+- **Basic UI & Error Handling**: Connection status indicators, reconnect button, and decryption-failure notices.
 
-## How It Works
-
-Every message is encrypted with **AES-256-GCM** before it ever touches the network. GCM mode does two things at once: it hides the message content, and it lets the receiving side detect if even one byte was changed in transit - tampered data is rejected outright rather than silently corrupted.
-
-Each message gets its own random 12-byte nonce. Reusing a nonce with the same key is the one mistake that breaks GCM's guarantees, so a fresh one is generated for every message sent, on both the Python and Dart sides.
-
-Because TCP is a stream of bytes with no built-in concept of "one message," every encrypted payload is preceded by a 4-byte big-endian length header stating exactly how many bytes follow. Both sides use this identical framing, which was stress-tested earlier in development with 20 messages sent back-to-back with zero delay - all arrived in order with no merging or splitting.
-
-The server relays encrypted bytes between connected clients without needing to read them - it only decrypts anything when explicitly started with `--debug`, for testing purposes.
-
-Both the Python and Dart implementations were directly cross-tested against each other (Python-encrypted messages decrypted correctly on the Dart/Java side and vice versa) before being wired into the full app, confirming the two languages produce byte-identical ciphertext layouts.
-
-## Folder Structure
+## Project Structure
 
 ```
-server/
-  server.py          # multi-client relay server
-  client.py           # terminal test client
-  crypto_utils.py     # shared AES-256-GCM + framing logic (Python side)
-android-app/
-  lib/
-    main.dart          # app entry point, Chats/Status/Calls tabs
-    chat_screen.dart    # the real chat UI, wired to ChatClient
-    chat_client.dart    # TCP socket handling + framing (Dart side)
-    crypto_utils.dart   # AES-256-GCM encryption (Dart side)
+.
+├── lib/               # Flutter client source (main.dart)
+├── server.py          # TCP chat server (multi-client, logging)
+├── client.py          # CLI test client
+├── crypto_utils.py    # AES-256-GCM logic for Python
+├── assets/            # Demo screenshots
+└── README.md
 ```
 
-## Running It
+## Message Format
 
-### 1. Start the server
+Each frame sent over the wire follows this layout:
+
+```
+[ 4-byte big-endian length ][ 12-byte nonce | ciphertext | 16-byte GCM tag ]
+```
+
+The length header covers only the encrypted payload. A pre-shared 256-bit key must be identical on both the client and server.
+
+## Setup & Running
+
+### 1. Server Setup
+Run from the root directory:
 ```bash
-cd server
 pip install cryptography
-python server.py --debug
+python server.py            # Listens on 0.0.0.0:5000
+python server.py --debug    # Also logs decrypted text (for testing only)
 ```
-`--debug` decrypts messages to the console so you can visually confirm encryption end to end - this is for testing only, see "Key handling" below.
+*Note: Find your computer's local IPv4 address using `ipconfig` (Windows) or `ifconfig` (Linux/macOS).*
 
-### 2. Run the Android app
-Open `android-app/` in Android Studio. In `lib/chat_client.dart` (or `ServerConfig`), set the host to your computer's actual local network IP (from `ipconfig`) - never `127.0.0.1`, which on a phone means "this phone," not your computer. The phone and the computer running the server must be on the same WiFi network, and that WiFi must be set to **Private** in Windows (a Public profile silently blocks the connection).
+### 2. Android App
+1. Open the project in Android Studio.
+2. In `lib/main.dart`, set `ServerConfig.host` to your server's IPv4 address.
+3. **Firewall**: Ensure your computer's firewall allows incoming traffic on port 5000.
+4. **Android SDK**: In `android/app/build.gradle`, set `minSdk` to **23** or higher (required by Keystore storage).
+5. Install dependencies and run:
+   ```bash
+   flutter pub get
+   flutter run
+   ```
+6. On first launch, enter the 256-bit shared key (64 hex characters). Use the top-right menu to reset the key/history.
 
-Run the app, tap a contact, and it connects automatically.
-
-### 3. (Optional) Terminal test client
-To test without a second device:
+### 3. CLI Client (Optional)
+To test interaction without a second physical phone:
 ```bash
-cd server
 python client.py --name Ali
 ```
-Messages sent from the phone appear in this terminal, and vice versa.
 
-## Real Test Output
+## Screenshots
 
-A full two-way conversation between the Android app and the terminal client, verified against the server's own log at the same timestamps - the decrypted server log, the terminal, and the phone screen all show identical message content, confirming encryption, relay, and decryption all worked correctly in both directions:
+### Android App
+<p align="center">
+  <img src="assets/image1.jpeg" width="350">
+  <img src="assets/image2.jpeg" width="350">
+</p>
 
-```
-Server log (--debug):
-16:05:47 [INFO] Message from 192.168.1.101:34494: 35 encrypted bytes
-16:05:47 [INFO]   [debug] decrypted: Hi 👋
-16:06:26 [INFO] Message from 127.0.0.1:56986: 52 encrypted bytes
-16:06:26 [INFO]   [debug] decrypted: Ali: Hello! How are you?
-...
+### Server & Terminal Client
+<p align="center">
+  <img src="assets/server.png" width="800">
+  <br>
+  <em>Server log showing encrypted/decrypted messages</em>
+</p>
 
-Phone screen (chat_screen.dart):
-  [sent]     Hi 👋
-  [received] Ali: Hello! How are you?
-  [sent]     I wanted to reach out regarding a small matter, at your convenience.
-  [received] Ali: What did you do?
-```
+<p align="center">
+  <img src="assets/client.png" width="800">
+  <br>
+  <em>Terminal test client interaction</em>
+</p>
 
-A longer follow-up session also confirmed the system recovers correctly from a real disconnect: the Android client's connection was forcibly closed mid-session (`WinError 10054`, which happens when a mobile app is backgrounded or the network briefly drops). The server logged the disconnect cleanly, removed the client without crashing, and the app reconnected on a new port two minutes later with the conversation continuing normally - demonstrating the error-handling requirement under a real failure, not just the happy path.
+## Security Notes and Key-Storage Risks
 
-## Key Handling - Risk Discussion (required by the brief)
+This is a learning prototype. Known limitations:
 
-A hardcoded 256-bit key is used in `CryptoUtils` on both sides to make the Python and Dart implementations interoperable for this prototype. This is **not secure for production**: if an attacker gains access to the source code or extracts the compiled app binary, they can retrieve the key and decrypt all captured traffic. A production-ready implementation should either use a key-exchange protocol (such as ECDH) to derive unique session keys per conversation, or store persistent keys in a secure hardware-backed location such as the Android Keystore.
+- **Pre-shared Key (PSK)**: The key is stored in the Android Keystore rather than source code, but it is manually shared. Anyone who obtains the key can read all captured traffic.
+- **No Key Exchange**: A production system should use ephemeral key exchange (e.g., ECDH/X25519) to derive unique session keys with forward secrecy.
+- **On-device Storage Risks**: On rooted devices, the key could potentially be accessed in memory while the app is running.
+- **Server Trust**: The server currently holds the same key. In a true E2EE system, the server should never have access to cleartext or keys.
+- **No User Authentication**: Any client with the key can connect and spoof identities.
 
-The server also holds this same key, meaning it technically could decrypt traffic if run with `--debug`. This is weaker than true end-to-end encryption between clients only, and is an explicit simplification made to keep the project's scope focused on encryption and socket programming rather than key distribution, which is a separate, harder problem.
+## Tech Stack
 
-## Limitations
-
-- Single hardcoded pre-shared key, as discussed above - no per-session key rotation.
-- No user authentication - anyone who connects to the server and has the key can participate.
-- Message history exists only for the current app session; nothing is persisted to disk.
-- Service/contact names ("Ali", "Sara", etc.) in the Android app are cosmetic placeholders - every contact opens the same underlying connection to the same server.
-
-## Requirements
-
-- Python 3.x with the `cryptography` package
-- Flutter/Dart with the `cryptography` pub package
+- **Frontend**: Flutter / Dart (`cryptography`, `flutter_secure_storage`)
+- **Backend**: Python (sockets, threading, `cryptography` library)
+- **Protocol**: Custom length-prefixed TCP
 
 ## Author
 
